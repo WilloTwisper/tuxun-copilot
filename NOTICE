@@ -1,0 +1,26 @@
+Tuxun Copilot - Attribution and License Notice
+===============================================
+
+Historical reference
+--------------------
+
+This project was originally inspired by the following public project:
+
+    tuxun-helper
+    Author: haczmrh
+    Source: https://github.com/haczmrh/tuxun-helper
+The current release is maintained as a clean rewrite with a new module
+layout, domain model, service boundaries, runtime lifecycle, and test suite.
+The historical upstream Git commits are intentionally excluded from the
+release history. No upstream license is relied upon by this release.
+
+The reference project is credited here for its initial product direction and
+is not an endorsement or affiliation.
+
+Third-party services
+--------------------
+
+Tuxun, Google Gemini, Google Maps, Google Street View, Clash, and mihomo are
+third-party products or services. Their names and trademarks belong to their
+respective owners. This project is unofficial and is not endorsed by or
+affiliated with those parties.
