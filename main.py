@@ -1,9 +1,12 @@
 # main.py
 import io
 import json
+import logging
 import os
 import sys
 import time
+from concurrent.futures import Future
+from threading import Event, Thread
 
 from google import genai
 from google.genai import types as genai_types
@@ -21,6 +24,31 @@ streetview_client: StreetViewClient
 gemini_router: GeminiRouter
 clash_controller: ClashController | None
 app_config: AppConfig
+logger = logging.getLogger("tuxun_copilot")
+
+
+def clock() -> str:
+    return time.strftime("%H:%M:%S")
+
+
+def debug(message: str, *args) -> None:
+    if app_config.debug_log:
+        logger.debug(message, *args)
+
+
+def run_in_background(function, *args) -> Future:
+    future: Future = Future()
+
+    def target() -> None:
+        if not future.set_running_or_notify_cancel():
+            return
+        try:
+            future.set_result(function(*args))
+        except BaseException as error:
+            future.set_exception(error)
+
+    Thread(target=target, name="round-analysis", daemon=True).start()
+    return future
 
 
 def initialize() -> None:
@@ -31,12 +59,16 @@ def initialize() -> None:
         os.environ["HTTP_PROXY"] = app_config.proxy
         os.environ["HTTPS_PROXY"] = app_config.proxy
     clients = [
-        genai.Client(api_key=key, http_options=genai_types.HttpOptions(timeout=90_000))
+        genai.Client(api_key=key, http_options=genai_types.HttpOptions(timeout=app_config.gemini_timeout_ms))
         for key in app_config.gemini_keys
     ]
     gemini_router = GeminiRouter(clients, app_config.gemini_models)
     tuxun_client = TuxunClient(app_config.tuxun_cookie, app_config.request_timeout)
     streetview_client = StreetViewClient(app_config.proxy, app_config.request_timeout)
+    if app_config.debug_log:
+        log_path = os.path.abspath(app_config.debug_log)
+        os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+        logging.basicConfig(filename=log_path, level=logging.DEBUG, encoding="utf-8")
     clash_controller = (
         ClashController(app_config.clash_controller, app_config.clash_secret, proxy_port=app_config.proxy)
         if app_config.clash_controller else None
@@ -89,26 +121,29 @@ ANALYSIS_PROMPT_FAST = ANALYSIS_PROMPT_COMMON + "\n\nreasoning 务必精简：�
 ANALYSIS_PROMPT_PRECISE = ANALYSIS_PROMPT_COMMON + "\n\nreasoning 要求：逐条列出依据的关键线索（语言、车牌、植被、地形、建筑风格等）的详细中文分析，信息越全越好。"
 
 
-def call_gemini(contents: list, config) -> str:
+def call_gemini(contents: list, config, max_attempts: int | None = None) -> str:
     """通过可测试的路由器调用 Gemini。"""
-    return gemini_router.generate(contents, config)
+    return gemini_router.generate(contents, config, max_attempts=max_attempts)
 
 
-def analyze_images_from_urls(image_urls: dict[str, str], analysis_mode: str) -> dict:
+def analyze_images_from_urls(image_urls: dict[str, str], analysis_mode: str, deadline_ms: int | None = None, cancel_event: Event | None = None) -> dict:
     """并行下载四个方向的街景图片，并让 Gemini 输出结构化的位置分析。"""
-    print("正在并行下载图片...")
     # 每日挑战选择高精度方案（时间充裕），对战/其余用快速方案（输出精简、响应快）
     if analysis_mode == "precise":
         prompt_text, scheme = ANALYSIS_PROMPT_PRECISE, "高精度"
     else:
         prompt_text, scheme = ANALYSIS_PROMPT_FAST, "快速"
-    print(f"当前分析方案: {scheme}")
+    debug("analysis scheme=%s urls=%s", scheme, image_urls)
     prompt_parts = [prompt_text]
+    if deadline_ms is not None and time.time() * 1000 >= deadline_ms:
+        raise RoundExpiredError("轮次已结束，取消图片分析")
     t_dl = time.time()
-    contents = streetview_client.download_many(list(image_urls.values()))
+    contents = streetview_client.download_many(
+        list(image_urls.values()), cancel_event=cancel_event, deadline_ms=deadline_ms
+    )
     dl_elapsed = time.time() - t_dl
     # 下载偏慢（>8s）时尝试自动切节点：大概率是当前线路质量问题
-    if dl_elapsed > 8 and clash_controller:
+    if dl_elapsed > 8 and clash_controller and analysis_mode != "fast" and (deadline_ms is None or time.time() * 1000 < deadline_ms):
         print(f"提示：下载耗时 {dl_elapsed:.1f}s 偏慢，尝试自动切换节点...")
         # 当前节点实际下载慢，拉黑一小段时间，避免测速又选回它
         clash_controller.blacklist_nodes(clash_controller.current_target_nodes(), cooldown=120)
@@ -116,52 +151,61 @@ def analyze_images_from_urls(image_urls: dict[str, str], analysis_mode: str) -> 
     loaded = 0
     for direction, content in zip(image_urls.keys(), contents):
         if content is None:
-            print(f"  {direction}视图下载失败，已跳过")
+            debug("image failed direction=%s", direction)
             continue
         try:
             prompt_parts.append(f"\n--- {direction}视图 ---")
             prompt_parts.append(Image.open(io.BytesIO(content)))
             loaded += 1
         except Exception as e:
-            print(f"  {direction}视图解析失败: {e}")
+            debug("image decode failed direction=%s error=%s", direction, e)
 
     if loaded == 0:
+        if cancel_event and cancel_event.is_set():
+            raise RoundExpiredError("轮次任务已取消")
         # 全部图片下载失败：当前节点对 Google 实际不通，拉黑并让上层切节点重试
         if clash_controller:
             clash_controller.blacklist_nodes(clash_controller.current_target_nodes())
         raise RuntimeError("所有方向的图片均下载失败，无法进行分析。")
 
-    current_model = gemini_router.last_model or gemini_router.models[0]
-    print(f"图片下载完成（{loaded} 张），正在请求 {current_model} 分析...")
+    debug("images loaded=%s/4 elapsed=%.1fs", loaded, dl_elapsed)
+
+    gemini_started = time.monotonic()
     # Gemini 调用通过代理偶发 SSL EOF / 连接中断，需重试；失败时自动切换 Clash 节点
     text = None
     last_err = None
-    for attempt in range(1, 4):
+    max_attempts = 2 if analysis_mode == "fast" else 3
+    for attempt in range(1, max_attempts + 1):
+        if cancel_event and cancel_event.is_set():
+            raise RoundExpiredError("轮次任务已取消")
+        if deadline_ms is not None and time.time() * 1000 >= deadline_ms:
+            raise RoundExpiredError("轮次已结束，取消 Gemini 请求")
         try:
             text = call_gemini(prompt_parts, genai_types.GenerateContentConfig(
                 response_mime_type="application/json",
                 response_schema=RESULT_SCHEMA,
-            ))
+            ), max_attempts=3 if analysis_mode == "fast" else None)
             break
         except Exception as e:
             last_err = e
             is_key_err = isinstance(e, GeminiCapacityError)
             # Key 配额问题（429）：重试无益，给分钟配额窗口留足时间
-            wait = 20 if is_key_err else attempt * 2
-            msg = f"  Gemini 请求失败（第 {attempt} 次），{wait} 秒后重试: {type(e).__name__}: {e}"
+            wait = 0 if is_key_err else attempt
+            msg = f"Gemini 请求失败（第 {attempt} 次）: {type(e).__name__}: {e}"
             # 网络类失败（断连/SSL EOF）说明当前节点对 Google 不可靠：拉黑当前节点再切换
             is_net_err = (
                 isinstance(e, (ConnectionError, TimeoutError))
                 or any(k in type(e).__name__ for k in ("ReadError", "ConnectError", "SSLError", "RemoteDisconnected"))
             )
-            if clash_controller and is_net_err and not is_key_err:
+            if clash_controller and is_net_err and not is_key_err and (deadline_ms is None or time.time() * 1000 + 3_000 < deadline_ms):
                 clash_controller.blacklist_nodes(clash_controller.current_target_nodes(), cooldown=300)
-                msg += "\n  提示：尝试自动切换 Clash 节点..."
-                print(msg)
-                clash_controller.pick_and_switch()
+                debug("%s; switching clash node", msg)
+                if analysis_mode != "fast":
+                    clash_controller.pick_and_switch()
             else:
-                print(msg)
-            time.sleep(wait)
+                debug("%s", msg)
+            if wait:
+                time.sleep(wait)
     if text is None:
         if isinstance(last_err, GeminiCapacityError):
             raise last_err
@@ -169,16 +213,18 @@ def analyze_images_from_urls(image_urls: dict[str, str], analysis_mode: str) -> 
     if not text:
         raise RuntimeError("模型未返回任何内容。")
     try:
-        return json.loads(text)
+        result = json.loads(text)
+        result["_model"] = gemini_router.last_model
+        result["_gemini_seconds"] = time.monotonic() - gemini_started
+        return result
     except json.JSONDecodeError:
-        print("警告：模型未返回合法 JSON，以下为原始输出：")
-        print(text)
+        debug("model returned invalid JSON: %s", text)
         raise RuntimeError("无法解析模型输出")
 
 
 def print_result(result: dict) -> None:
     """格式化打印 AI 的分析结果，并附带可直接点击的地图链接。"""
-    print("\n--- Gemini 的分析结果 ---")
+    print("\n--- 分析结果 ---")
 
     print(f"大洲: {result.get('continent', '未知')}")
 
@@ -208,6 +254,8 @@ def print_result(result: dict) -> None:
     reasoning = result.get('reasoning')
     if reasoning:
         print(f"线索分析: {reasoning}")
+    if result.get("_model"):
+        print(f"模型: {result['_model']}，Gemini 用时: {result.get('_gemini_seconds', 0):.1f}s，总用时: {result.get('_total_seconds', 0):.1f}s")
     print("--------------------------")
 
 
@@ -254,46 +302,47 @@ def preflight_checks() -> None:
     print("=== 预检完成 ===\n")
 
 
-def analyze_round(pano_id: str, analysis_mode: str, round_no: int = 0) -> None:
+class RoundExpiredError(RuntimeError):
+    pass
+
+
+def analyze_round(pano_id: str, analysis_mode: str, round_no: int = 0, deadline_ms: int | None = None, cancel_event: Event | None = None) -> dict:
     """下载当前轮次的四方向图片并分析，结果打印到控制台。
 
     失败时先按测速切最优节点重试；仍失败则强制轮换到不同节点再试一次。
     对战中一轮的机会不能轻易丢，但最多 3 次尝试。
     """
+    def expired() -> bool:
+        return deadline_ms is not None and time.time() * 1000 >= deadline_ms
+
+    if expired():
+        raise RoundExpiredError(f"第 {round_no} 轮已超过截止时间")
     image_urls = streetview_client.image_urls(pano_id)
-    for direction, url in image_urls.items():
-        print(f"- {direction}视图 URL: {url}")
+    started = time.monotonic()
     try:
-        result = analyze_images_from_urls(image_urls, analysis_mode)
-        print_result(result)
-        return
+        result = analyze_images_from_urls(image_urls, analysis_mode, deadline_ms, cancel_event)
+        result["_total_seconds"] = time.monotonic() - started
+        return result
     except Exception as e:
-        if not clash_controller:
+        if isinstance(e, RoundExpiredError):
+            raise
+        if not clash_controller or analysis_mode == "fast" or (cancel_event and cancel_event.is_set()) or (deadline_ms is not None and time.time() * 1000 + 3_000 >= deadline_ms):
             raise
         if isinstance(e, GeminiCapacityError):
             # Key 配额问题：切节点无用，等一个分钟配额窗口后直接重试一次
-            print(f"第 {round_no} 轮分析失败（Key 配额: {e}），20 秒后重试...")
-            time.sleep(20)
-            try:
-                result = analyze_images_from_urls(image_urls, analysis_mode)
-                print_result(result)
-                return
-            except Exception as e2:
-                raise RuntimeError(f"Key 配额重试仍失败: {e2}") from e
+            debug("round %s capacity failure: %s", round_no, e)
+            raise
         # 第 1 次重试：按测速切最优节点
-        print(f"第 {round_no} 轮分析失败（{e}），自动切换节点后重试...")
+        debug("round %s failed with %s, switching node", round_no, type(e).__name__)
         clash_controller.pick_and_switch()
         try:
-            result = analyze_images_from_urls(image_urls, analysis_mode)
-            print_result(result)
-            return
+            return analyze_images_from_urls(image_urls, analysis_mode, deadline_ms, cancel_event)
         except Exception as e2:
             # 第 2 次重试：强制轮换到不同节点（测速"正常"但实际不通的场景）
-            print(f"重试仍失败（{e2}），强制轮换节点后再试...")
+            debug("round retry failed: %s; forcing node rotation", e2)
             clash_controller.pick_and_switch(exclude_current=True)
             try:
-                result = analyze_images_from_urls(image_urls, analysis_mode)
-                print_result(result)
+                return analyze_images_from_urls(image_urls, analysis_mode, deadline_ms, cancel_event)
             except Exception as e3:
                 raise RuntimeError(f"轮换节点后重试仍失败: {e3}") from e2
 
@@ -307,8 +356,34 @@ def monitor_game(game_id: str) -> None:
     interval = app_config.monitor_interval
     print(f"\n进入监控模式（每 {interval:.0f} 秒轮询，Ctrl+C 返回输入）...")
     analyzed: set[int] = set()
-    while True:
+    active_future: Future | None = None
+    active_round: int | None = None
+    active_deadline: int | None = None
+    active_cancel: Event | None = None
+    seen_ongoing = False
+    try:
+      while True:
         try:
+            if active_future and active_future.done():
+                try:
+                    result = active_future.result()
+                    latest = tuxun_client.get_game(game_id)
+                    still_current = latest and latest.status == "ongoing" and latest.current_round == active_round
+                    if still_current:
+                        print_result(result)
+                        analyzed.add(active_round)
+                    else:
+                        print(f"[{clock()}] 第 {active_round} 轮结果已过期，丢弃迟到答案。")
+                except RoundExpiredError as error:
+                    print(f"[{clock()}] 第 {active_round} 轮跳过：{error}")
+                    analyzed.add(active_round)
+                except Exception as error:
+                    print(f"[{clock()}] 第 {active_round} 轮分析失败：{error}")
+                active_future = None
+                active_round = None
+                active_deadline = None
+                active_cancel = None
+
             try:
                 data = tuxun_client.get_game(game_id)
             except Exception as error:
@@ -324,34 +399,82 @@ def monitor_game(game_id: str) -> None:
             rounds = data.rounds
             total = data.total_rounds or '?'
 
+            if active_future and active_round == data.current_round and active_round is not None:
+                live_round = next((item for item in rounds if item.number == active_round), None)
+                if live_round:
+                    live_deadline = data.deadline_ms(live_round)
+                    if live_deadline and int(time.time() * 1000) >= live_deadline:
+                        print(f"[{clock()}] 第 {active_round} 轮已到截止时间，停止后续处理。")
+                        if active_cancel:
+                            active_cancel.set()
+                        analyzed.add(active_round)
+                        active_future = None
+                        active_round = None
+                        active_deadline = None
+                        active_cancel = None
+
             if status != 'ongoing':
-                # 游戏已结束/未开：若一局都没分析过，补分析最后一轮
-                if not analyzed and rounds:
+                if active_future and not active_future.done():
+                    print(f"[{clock()}] 游戏已结束，取消展示第 {active_round} 轮迟到结果。")
+                    if active_cancel:
+                        active_cancel.set()
+                    active_future = None
+                    active_round = None
+                    active_deadline = None
+                # 直接粘贴已结束游戏时保留一次最后轮分析；进行中的游戏结束时不再启动新任务。
+                if not seen_ongoing and not analyzed and rounds and not active_future:
                     round_ = rounds[-1]
-                    print(f"\n游戏状态为 {status}，补分析最后一轮（第 {round_.number} 轮）...")
+                    print(f"\n[{clock()}] 游戏状态为 {status}，补分析最后一轮（第 {round_.number} 轮）...")
                     try:
-                        analyze_round(round_.pano_id, data.mode, round_.number)
-                    except Exception as e:
-                        print(f"最后一轮分析失败: {e}")
+                        print_result(analyze_round(round_.pano_id, data.mode, round_.number))
+                    except Exception as error:
+                        print(f"最后一轮分析失败：{error}")
                 print("游戏已结束，返回等待输入。")
                 return
 
-            # 检测并分析新轮次
-            for round_ in rounds:
+            seen_ongoing = True
+
+            # 只追踪当前轮，避免模型阻塞后把已经过期的旧轮次排队分析。
+            round_ = data.active_round
+            if round_ and round_.number not in analyzed and not active_future:
                 n = round_.number
-                if n in analyzed:
-                    continue
-                print(f"\n>>> 检测到第 {n}/{total} 轮开始，开始分析...")
-                try:
-                    analyze_round(round_.pano_id, data.mode, n)
+                deadline = data.deadline_ms(round_)
+                remaining = (deadline - int(time.time() * 1000)) / 1000 if deadline else None
+                if remaining is not None and remaining <= 0:
+                    print(f"[{clock()}] 第 {n}/{total} 轮已过期，跳过。")
                     analyzed.add(n)
-                except Exception as e:
-                    print(f"第 {n} 轮分析失败: {e}")
+                else:
+                    left = f"，剩余约 {remaining:.1f}s" if remaining is not None else ""
+                    guesses = len(round_.guessed_user_ids)
+                    players = data.player_count or "?"
+                    print(f"\n[{clock()}] 第 {n}/{total} 轮开始分析{left}，已提交 {guesses}/{players}...")
+                    active_cancel = Event()
+                    active_future = run_in_background(analyze_round, round_.pano_id, data.mode, n, deadline, active_cancel)
+                    active_round = n
+                    active_deadline = deadline
+
+            if active_future and active_round is not None and data.current_round is not None and data.current_round != active_round:
+                print(f"[{clock()}] 已进入第 {data.current_round} 轮，停止展示第 {active_round} 轮后续结果。")
+                if active_cancel:
+                    active_cancel.set()
+                analyzed.add(active_round)
+                active_future = None
+                active_round = None
+                active_deadline = None
+                active_cancel = None
 
             time.sleep(interval)
         except KeyboardInterrupt:
+            if active_cancel:
+                active_cancel.set()
             print("\n已退出监控模式，返回等待输入。")
             return
+        except Exception as error:
+            print(f"[{clock()}] 监控循环异常：{error}")
+            time.sleep(interval)
+    finally:
+        if active_cancel:
+            active_cancel.set()
 
 
 def main() -> int:

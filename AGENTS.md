@@ -15,6 +15,7 @@ Automated GeoGuessr-style helper for [tuxun.fun](https://tuxun.fun): fetches 4-d
 ## Monitor mode (auto round-following)
 
 - `main.py` runs `preflight_checks()` at startup (download a probe thumbnail + text Gemini call; on failure auto-switch node once), then `monitor_game()` per ID: polls `TuxunClient.get_game()` every 2s, analyzes each new `GameRound.number` once, and exits back to the input loop when `status != "ongoing"`.
+- Round analysis runs in a daemon worker with a cooperative cancellation event. The monitor keeps polling while Gemini/download work runs; when `currentRound` changes or the round deadline passes, it discards the late result and moves on. Default CLI output omits image URLs; set `TUXUN_DEBUG_LOG` for diagnostics.
 - Rationale: the game URL stays the same across rounds; the right moment to read is when a new round's `panoId` actually appears in the API (reading too early gets the previous round). No per-round pasting needed.
 - If a finished game is pasted, monitor analyzes the last round once then returns. Ctrl+C in monitor returns to input (outer Ctrl+C quits).
 - `TuxunClient.get_game(game_id)` returns a typed `GameState` (challenge→solo fallback, includes explicit `mode`). `TuxunClient.current_user_id()` validates the Cookie. The monitor consumes `GameRound` objects instead of raw API dictionaries.
@@ -25,6 +26,7 @@ Automated GeoGuessr-style helper for [tuxun.fun](https://tuxun.fun): fetches 4-d
 - **Model fallbacks** (`GEMINI_MODEL_FALLBACKS`, comma-separated): free-tier quota is per-model-per-project, so when the primary model 429s, `GeminiRouter` rotates through (model, key) combinations. A 404 disables only that model/key combination for the session; a successful combination remains selected until it fails.
 - **403-permanently-dead keys are marked (`dead_key_idx`) and never tried again this session**; 429 keeps cycling live keys (2 rounds) then raises `所有可用 Gemini Key 均被限流（429）`.
 - **Key-level errors (429/403) must NOT trigger node switching** — quota is not a network problem. `analyze_round` waits ~20s (per-minute window) then retries once; the retry loop uses fixed 20s backoff on key errors vs `attempt*2` on network errors. Free-tier daily quota exhaustion (all-call 429) only resets at midnight PT.
+- **503/504 model service errors must rotate model/key combinations, not Clash nodes**. Fast PvP analysis uses a bounded three-combination attempt budget; do not turn service capacity failures into proxy sweeps.
 
 ## Node auto-failover (Clash)
 - `.env`: `CLASH_CONTROLLER` (e.g. `http://127.0.0.1:9097`) + `CLASH_SECRET`; requires the External Controller toggle in Clash Verge settings. Without it everything silently downgrades to today's behavior.

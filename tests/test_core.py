@@ -78,6 +78,21 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(state.ready_rounds[0].pano_id, "pano-2")
         self.assertEqual(state.total_rounds, 5)
 
+    def test_game_state_exposes_deadline_and_guesses(self):
+        state = parse_game_state("ABC123", {
+            "status": "ongoing",
+            "currentRound": 2,
+            "roundNumber": 5,
+            "roundTimePeriod": 15000,
+            "playerIds": ["a", "b"],
+            "teams": [{"teamUsers": [{"user": {"userId": "a"}, "guesses": [{"round": 2}]}]}],
+            "rounds": [{"round": 2, "panoId": "pano-2", "timerStartTime": 1000}],
+        }, "fast")
+        self.assertEqual(state.current_round, 2)
+        self.assertEqual(state.deadline_ms(state.active_round), 16000)
+        self.assertEqual(state.active_round.guessed_user_ids, ("a",))
+        self.assertEqual(state.player_count, 2)
+
     def test_streetview_urls_have_four_yaws(self):
         urls = StreetViewClient().image_urls("pano")
         self.assertEqual(tuple(urls), ("前", "右", "后", "左"))

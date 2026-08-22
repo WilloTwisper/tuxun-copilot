@@ -34,13 +34,16 @@ class GeminiRouter:
             return "model"
         if "RESOURCE_EXHAUSTED" in text or "429" in text:
             return "quota"
+        if any(marker in text for marker in ("503", "504", "UNAVAILABLE", "DEADLINE_EXCEEDED")):
+            return "service"
         return "other"
 
-    def generate(self, contents: Any, config: Any) -> str | None:
+    def generate(self, contents: Any, config: Any, max_attempts: int | None = None) -> str | None:
         combinations = [(model_index, key_index)
                         for model_index in range(len(self.models))
                         for key_index in range(len(self.clients))]
-        for _ in range(max(1, len(combinations) * 2)):
+        attempt_limit = max_attempts or max(1, len(combinations) * 2)
+        for _ in range(attempt_limit):
             combination = combinations[self._cursor % len(combinations)]
             model_index, key_index = combination
             if key_index in self.dead_keys or combination in self.dead_combinations:
@@ -66,6 +69,10 @@ class GeminiRouter:
                 if kind == "quota":
                     self._cursor += 1
                     self._sleep(1)
+                    continue
+                if kind == "service":
+                    # 服务端容量/截止时间问题与本地代理无关，直接尝试下一个模型/Key。
+                    self._cursor += 1
                     continue
                 raise
         raise GeminiCapacityError("所有可用 Gemini 模型和 Key 均不可用或被限流")

@@ -92,6 +92,8 @@ CLASH_SECRET="your_clash_controller_secret"
 | `PROXY` | 否 | Google API 和街景请求使用的 HTTP/Clash 混合端口 |
 | `CLASH_CONTROLLER` | 否 | Clash/mihomo External Controller 地址；配置后启用自动节点切换 |
 | `CLASH_SECRET` | 否 | External Controller 密钥 |
+| `TUXUN_DEBUG_LOG` | 否 | 详细诊断日志路径；开启后记录图片 URL 和网络细节 |
+| `GEMINI_TIMEOUT_MS` | 否 | 单次 Gemini 请求超时，默认 12000 毫秒 |
 
 ### 获取 tuxun.fun Cookie
 
@@ -116,7 +118,9 @@ https://tuxun.fun/solo/Ge9g36p53Vf2yAL9
 https://tuxun.fun/challenge/00000000-0000-0000-0000-000000000000
 ```
 
-程序进入监控模式后会轮询游戏状态，发现新轮次即分析；游戏结束后返回输入界面。监控过程中按 `Ctrl+C` 返回输入界面，在外层再次按 `Ctrl+C` 退出。
+程序进入监控模式后会轮询游戏状态，发现当前轮次即分析；游戏结束后返回输入界面。默认只输出轮次、倒计时、已提交人数、阶段耗时和最终结果，不输出四个图片 URL。需要诊断网络时设置 `TUXUN_DEBUG_LOG`，图片 URL 和异常细节会写入日志文件。
+
+分析任务在后台执行，监控循环继续读取游戏状态。如果 API 显示已进入下一轮、当前轮已结束或剩余时间不足，迟到结果会被丢弃，避免旧轮次阻塞后续轮次。快速对战模式默认使用更短的 Gemini 超时；高精度模式允许更多重试，但同样受轮次截止时间保护。
 
 ## 工作原理
 

@@ -21,7 +21,9 @@ class AppConfig:
     clash_controller: str | None
     clash_secret: str
     request_timeout: float = 15.0
+    gemini_timeout_ms: int = 12_000
     monitor_interval: float = 2.0
+    debug_log: str | None = None
 
     @classmethod
     def from_env(cls, dotenv_path: str | None = None) -> "AppConfig":
@@ -47,4 +49,6 @@ class AppConfig:
             proxy=proxy,
             clash_controller=controller,
             clash_secret=os.getenv("CLASH_SECRET", ""),
+            gemini_timeout_ms=int(os.getenv("GEMINI_TIMEOUT_MS", "12000")),
+            debug_log=os.getenv("TUXUN_DEBUG_LOG") or None,
         )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from threading import Event
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlencode
 
@@ -25,7 +26,7 @@ class StreetViewClient:
             for name, yaw in self.DIRECTIONS
         }
 
-    def _request(self, url: str) -> bytes:
+    def _request(self, url: str, cancel_event: Event | None = None, deadline_ms: int | None = None) -> bytes:
         kwargs = {
             "headers": {"User-Agent": "Mozilla/5.0", "Referer": "https://maps.google.com/"},
             "timeout": self.timeout,
@@ -34,10 +35,17 @@ class StreetViewClient:
             kwargs["proxies"] = {"http": self.proxy, "https": self.proxy}
         last_error: Exception | None = None
         for attempt in range(3):
+            if cancel_event and cancel_event.is_set():
+                raise RuntimeError("街景任务已取消")
             try:
+                timeout = self.timeout
+                if deadline_ms is not None:
+                    timeout = min(timeout, max(0.2, (deadline_ms - time.time() * 1000) / 1000))
                 with requests.Session() as session:
                     session.trust_env = False
-                    response = session.get(url, **kwargs)
+                    request_kwargs = dict(kwargs)
+                    request_kwargs["timeout"] = timeout
+                    response = session.get(url, **request_kwargs)
                 response.raise_for_status()
                 if not response.content:
                     raise RuntimeError("街景服务返回空响应")
@@ -48,17 +56,18 @@ class StreetViewClient:
                     time.sleep((attempt + 1) * 1.5)
         raise RuntimeError(f"街景下载失败: {last_error}")
 
-    def download_one(self, url: str) -> bytes:
-        return self._request(url)
+    def download_one(self, url: str, cancel_event: Event | None = None, deadline_ms: int | None = None) -> bytes:
+        return self._request(url, cancel_event, deadline_ms)
 
-    def download_many(self, urls: list[str], workers: int = 4) -> list[bytes | None]:
+    def download_many(self, urls: list[str], workers: int = 4, cancel_event: Event | None = None, deadline_ms: int | None = None) -> list[bytes | None]:
         results: list[bytes | None] = [None] * len(urls)
         with ThreadPoolExecutor(max_workers=min(workers, len(urls) or 1)) as pool:
-            futures = {pool.submit(self._request, url): index for index, url in enumerate(urls)}
+            futures = {pool.submit(self._request, url, cancel_event, deadline_ms): index for index, url in enumerate(urls)}
             for future in as_completed(futures):
                 index = futures[future]
                 try:
                     results[index] = future.result()
-                except Exception as error:
-                    print(f"  街景下载失败: {error}")
+                except Exception:
+                    # 单张失败由调用方按方向统计，默认不刷屏。
+                    pass
         return results
